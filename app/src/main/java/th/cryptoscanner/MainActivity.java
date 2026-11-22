@@ -25,7 +25,7 @@ public class MainActivity extends Activity {
     final int WHITE = 0xffF8FAFC;
     final int GRAY = 0xff94A3B8;
 
-    EditText capital, fee1, fee2, buffer;
+    EditText capital, fee1, fee2, buffer, apiKey, apiSecret;
     TextView status, best, stats;
     LinearLayout results;
     Button scan;
@@ -119,7 +119,7 @@ public class MainActivity extends Activity {
         TextView title = text(root, "THAI CRYPTO SCANNER", 23, WHITE);
         title.setTypeface(null, Typeface.BOLD);
 
-        text(root, "V3.0 PRO • BITKUB × BINANCE TH", 13, GREEN);
+        text(root, "V4.0 PRO • BITKUB × BINANCE TH", 13, GREEN);
         text(root, "ข้อมูลตลาดจาก API | ซื้อขายจำลอง", 13, GRAY);
 
         LinearLayout summary = card(root);
@@ -134,8 +134,12 @@ public class MainActivity extends Activity {
         capital = field(settings, "มูลค่าซื้อจำลอง (บาท)", "10000");
         fee1 = field(settings, "ค่าธรรมเนียม Bitkub (%)", "0.25");
         fee2 = field(settings, "ค่าธรรมเนียม Binance TH (%)", "0.25");
-        buffer = field(settings, "ต้นทุนสำรองต่อรายการ (บาท)", "50");
+        buffer = field(settings, "ต้นทุนสำรองเพิ่มเติม (บาท)", "10");
 
+        text(settings, "Bitkub API แบบอ่านข้อมูลเท่านั้น (ไม่บันทึกรหัส)", 13, GRAY);
+        apiKey = new EditText(this); apiKey.setTextColor(WHITE); apiKey.setHintTextColor(GRAY); apiKey.setHint("API Key"); apiKey.setSingleLine(true); apiKey.setInputType(129); settings.addView(apiKey);
+        apiSecret = new EditText(this); apiSecret.setTextColor(WHITE); apiSecret.setHintTextColor(GRAY); apiSecret.setHint("API Secret"); apiSecret.setSingleLine(true); apiSecret.setInputType(129); settings.addView(apiSecret);
+        apiKey.setSaveEnabled(false); apiSecret.setSaveEnabled(false);
         auto = new CheckBox(this);
         auto.setText("สแกนอัตโนมัติ");
         auto.setTextColor(WHITE);
@@ -156,7 +160,7 @@ public class MainActivity extends Activity {
             Intent i = new Intent(Intent.ACTION_SEND);
             i.setType("text/plain");
             i.putExtra(Intent.EXTRA_TEXT,
-                "time,coin,buy,sell,net,roi\n" + history);
+                "time,coin,buy,sell,net,roi,transfer_verified,network\n" + history);
             startActivity(Intent.createChooser(i, "แชร์ประวัติ"));
         });
 
@@ -167,13 +171,13 @@ public class MainActivity extends Activity {
         results.setOrientation(1);
         root.addView(results);
 
-        history = getPreferences(0).getString("history", "");
-        rounds = getPreferences(0).getLong("rounds", 0);
-        hits = getPreferences(0).getLong("hits", 0);
+        history = getPreferences(0).getString("history_v4", "");
+        rounds = getPreferences(0).getLong("rounds_v4", 0);
+        hits = getPreferences(0).getLong("hits_v4", 0);
 
         try {
             record = Double.parseDouble(
-                getPreferences(0).getString("record", "-Infinity"));
+                getPreferences(0).getString("record_v4", "-Infinity"));
         } catch(Exception ignored) {}
     }
 
@@ -204,14 +208,17 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    JSONObject get(String url) throws Exception {
+    JSONObject get(String url) throws Exception { return get(url, Collections.emptyMap()); }
+    JSONObject get(String url, Map<String,String> headers) throws Exception {
         HttpURLConnection c =
             (HttpURLConnection)new URL(url).openConnection();
 
+        c.setInstanceFollowRedirects(false);
+        for (Map.Entry<String,String> entry : headers.entrySet()) c.setRequestProperty(entry.getKey(), entry.getValue());
         c.setConnectTimeout(7000);
         c.setReadTimeout(7000);
         c.setRequestProperty("Accept", "application/json");
-        c.setRequestProperty("User-Agent", "ThaiCryptoScanner/3.0");
+        c.setRequestProperty("User-Agent", "ThaiCryptoScanner/4.0");
 
         try {
             int code = c.getResponseCode();
@@ -348,8 +355,55 @@ public class MainActivity extends Activity {
         return new Book(j);
     }
 
+    Map<String,JSONArray> bitkubNetworks(String key, String secret) throws Exception {
+        if (key.isEmpty() || secret.isEmpty()) throw new IOException("ยังไม่ได้ตั้ง API Bitkub");
+        HttpURLConnection conn = (HttpURLConnection)new URL("https://api.bitkub.com/api/v3/servertime").openConnection();
+        conn.setConnectTimeout(7000); conn.setReadTimeout(7000);
+        String ts;
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(conn.getInputStream()))) { ts = r.readLine().trim(); } finally { conn.disconnect(); }
+        if (!ts.matches("[0-9]{13}")) throw new IOException("เวลา API ไม่ถูกต้อง");
+        String path = "/api/v4/crypto/coins";
+        javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+        mac.init(new javax.crypto.spec.SecretKeySpec(secret.getBytes("UTF-8"), "HmacSHA256"));
+        StringBuilder sig = new StringBuilder();
+        for (byte v : mac.doFinal((ts+"GET"+path).getBytes("UTF-8"))) sig.append(String.format(Locale.US,"%02x",v & 255));
+        Map<String,String> headers = new HashMap<>();
+        headers.put("X-BTK-APIKEY",key); headers.put("X-BTK-TIMESTAMP",ts); headers.put("X-BTK-SIGN",sig.toString());
+        JSONObject j = get("https://api.bitkub.com"+path,headers);
+        if (!"0".equals(j.optString("code"))) throw new IOException("Bitkub metadata error");
+        Map<String,JSONArray> m = new HashMap<>();
+        JSONArray items = j.getJSONObject("data").getJSONArray("items");
+        for(int i=0;i<items.length();i++){ JSONObject o=items.getJSONObject(i); m.put(o.getString("symbol"),o.getJSONArray("networks")); }
+        return m;
+    }
+    JSONArray binanceNetworks(String coin) throws Exception {
+        JSONObject j=get("https://www.binance.th/bapi/capital/v2/public/capital/config/getOne?coin="+coin);
+        if (!"000000".equals(j.optString("code"))) throw new IOException("Binance metadata error");
+        return j.getJSONArray("data");
+    }
+    static class Transfer { double fee; String network; Transfer(double f,String n){fee=f;network=n;} }
+    static Transfer route(JSONArray bk, JSONArray bn, boolean fromBk, double qty) throws Exception {
+        if(bk==null || bn==null) throw new IOException("ยังไม่ทราบเครือข่ายร่วม");
+        Transfer best=null;
+        for(int i=0;i<bk.length();i++) for(int j=0;j<bn.length();j++) {
+            JSONObject x=bk.getJSONObject(i), y=bn.getJSONObject(j);
+            String n=x.optString("network");
+            if(n.isEmpty() || !n.equals(y.optString("network")) || y.optBoolean("busy",true)) continue;
+            if(fromBk ? !(x.optBoolean("withdraw_enable") && y.optBoolean("depositEnable")) : !(y.optBoolean("withdrawEnable") && x.optBoolean("deposit_enable"))) continue;
+            double f=fromBk?x.optDouble("withdraw_fee",Double.NaN):y.optDouble("withdrawFee",Double.NaN);
+            double min=fromBk?x.optDouble("withdraw_min",Double.NaN):y.optDouble("withdrawMin",Double.NaN);
+            double dep=fromBk?(y.has("depositFee") && y.isNull("depositFee")?0:y.optDouble("depositFee",Double.NaN)):0;
+            if(!Double.isFinite(f)||!Double.isFinite(min)||!Double.isFinite(dep)||f<0||min<0||dep<0||qty-f-dep<min||qty<=f+dep) continue;
+            if(fromBk && qty-f-dep<y.optDouble("depositDust",Double.POSITIVE_INFINITY)) continue;
+            if(!fromBk && qty>y.optDouble("withdrawMax",0)) continue;
+            if(best==null||f+dep<best.fee) best=new Transfer(f+dep,n);
+        }
+        if(best==null) throw new IOException("ไม่พบเครือข่ายที่ยืนยันได้");
+        return best;
+    }
+    static double acquired(Book a,double cash){double q=0;for(double[] r:a.asks){double v=Math.min(cash,r[0]*r[1]);q+=v/r[0];cash-=v;}return q;}
     static double net(Book a, Book b, double cash,
-                      double fa, double fb, double extra)
+                      double fa, double fb, double extra, double transferFee)
                       throws Exception {
 
         if (Math.abs(a.at - b.at) > 3000 ||
@@ -369,6 +423,8 @@ public class MainActivity extends Activity {
         if (left > 0.00001)
             throw new IOException("ปริมาณซื้อไม่พอ");
 
+        q -= transferFee;
+        if(q<=0) throw new IOException("ค่าโอนสูงเกินจำนวนเหรียญ");
         double revenue = 0;
 
         for (double[] r : b.bids) {
@@ -388,6 +444,9 @@ public class MainActivity extends Activity {
         String coin, buy, sell;
         double profit, roi, ask, bid;
         long time;
+        double before, transferCost;
+        String network = "ไม่ทราบ";
+        boolean verified;
 
         Opportunity(String c, String x, String y,
                     double p, double r, double a, double b) {
@@ -446,6 +505,7 @@ public class MainActivity extends Activity {
             return;
         }
 
+        final String key=apiKey.getText().toString().trim(), secret=apiSecret.getText().toString().trim();
         busy = true;
         scan.setEnabled(false);
 
@@ -463,6 +523,8 @@ public class MainActivity extends Activity {
 
             try {
                 discover();
+                Map<String,JSONArray> bkMeta = Collections.emptyMap();
+                try { bkMeta=bitkubNetworks(key,secret); } catch(Exception ex){errors.add("Bitkub: ไม่สามารถตรวจสอบข้อมูลโอน (ตรวจ API Key/Secret)");}
                 total = coins.size();
 
                 for (String coin : coins) {
@@ -478,6 +540,8 @@ public class MainActivity extends Activity {
                             "กำลังสแกน " + coin +
                             " (" + current + "/" + count + ")"));
 
+                    JSONArray bnMeta=null;
+                    try { bnMeta=binanceNetworks(coin); } catch(Exception ex){errors.add(coin+": Binance TH ข้อมูลเครือข่ายไม่พร้อม");}
                     try {
                         Future<Book> f =
                             pair.submit(() -> book(true, coin));
@@ -497,15 +561,22 @@ public class MainActivity extends Activity {
                                 double p = net(
                                     buyBook, sellBook, c,
                                     k == 0 ? a : b,
-                                    k == 0 ? b : a, e);
+                                    k == 0 ? b : a, e, 0);
 
-                                found.add(new Opportunity(
+                                Opportunity op = new Opportunity(
                                     coin,
                                     k == 0 ? "Bitkub" : "Binance TH",
                                     k == 0 ? "Binance TH" : "Bitkub",
                                     p, p / c * 100,
                                     buyBook.asks.get(0)[0],
-                                    sellBook.bids.get(0)[0]));
+                                    sellBook.bids.get(0)[0]);
+                                op.before=p+e;
+                                try {
+                                    Transfer t=route(bkMeta.get(coin),bnMeta,k==0,acquired(buyBook,c));
+                                    op.profit=net(buyBook,sellBook,c,k==0?a:b,k==0?b:a,e,t.fee);
+                                    op.roi=op.profit/c*100; op.network=t.network; op.transferCost=p-op.profit; op.verified=true;
+                                } catch(Exception ex){ op.network=ex.getMessage(); }
+                                found.add(op);
 
                             } catch(Exception ex) {
                                 errors.add(coin + ": " + ex.getMessage());
@@ -536,7 +607,7 @@ public class MainActivity extends Activity {
             }
 
             found.sort((x, y) ->
-                Double.compare(y.profit, x.profit));
+                x.verified != y.verified ? (x.verified ? -1 : 1) : Double.compare(y.profit, x.profit));
 
             final int n = total;
             final int attempted = checked;
@@ -563,28 +634,28 @@ public class MainActivity extends Activity {
 
         for (Opportunity o : rows) {
             successful.add(o.coin);
-            if (o.profit > 0) positive++;
+            if (o.verified && o.profit > 0) positive++;
 
-            record = Math.max(record, o.profit);
+            if(o.verified) record = Math.max(record, o.profit);
 
             csv.append(o.time).append(",")
                 .append(o.coin).append(",")
                 .append(o.buy).append(",")
                 .append(o.sell).append(",")
                 .append(o.profit).append(",")
-                .append(o.roi).append("\n");
+                .append(o.roi).append(",").append(o.verified).append(",").append(o.verified?o.network:"UNKNOWN").append("\n");
         }
 
         rounds++;
         hits += positive;
 
-        if (!rows.isEmpty()) {
+        if (!rows.isEmpty() && rows.get(0).verified) {
             double p = rows.get(0).profit;
 
             best.setText(money(p) + " บาท");
             best.setTextColor(p > 0 ? GREEN : RED);
         } else {
-            best.setText("-- ไม่มีข้อมูล");
+            best.setText("-- ยังไม่ยืนยันค่าโอน");
             best.setTextColor(GRAY);
         }
 
@@ -611,19 +682,21 @@ public class MainActivity extends Activity {
             text(item, o.buy + " → " + o.sell, 14, GRAY);
 
             TextView profit = text(item,
-                money(o.profit) + " บาท",
-                24, o.profit > 0 ? GREEN : RED);
+                (o.verified ? money(o.profit) : "ยังไม่ยืนยัน") + " บาท",
+                24, !o.verified ? GRAY : o.profit > 0 ? GREEN : RED);
 
             profit.setTypeface(null, Typeface.BOLD);
 
             text(item, String.format(Locale.US,
-                "%+.3f%%", o.roi), 16,
+                "%+.3f%% ("+(o.verified?"หลังค่าโอน":"ก่อนค่าโอน")+")", o.roi), 16,
                 o.profit > 0 ? GREEN : RED);
 
             text(item, String.format(Locale.US,
                 "ซื้อ: %.8f\nขาย: %.8f",
                 o.ask, o.bid), 12, GRAY);
 
+            text(item,"หลังค่าซื้อขาย ก่อนค่าโอน/สำรอง: "+money(o.before)+" บาท",12,GRAY);
+            text(item,o.verified ? "เครือข่าย: "+o.network+" | ค่าโอนประมาณ "+money(o.transferCost)+" บาท" : "ค่าโอนยังไม่ยืนยัน: "+o.network,12,GRAY);
             text(item, new Date(o.time).toString(), 11, GRAY);
         }
 
@@ -637,7 +710,7 @@ public class MainActivity extends Activity {
 
         text(results,
             "ผลจำลองก่อนภาษี ไม่รับประกันการซื้อขายจริง " +
-            "ไม่ได้ตรวจสอบยอดเงิน การโอนเหรียญ หรือค่าถอนจริง",
+            "ไม่ตรวจยอดเงินหรือเวลาที่โอนจริง ต้องยืนยันเครือข่ายและข้อจำกัดในตลาดก่อนใช้งาน",
             12, GRAY);
 
         history += csv.toString();
@@ -648,10 +721,10 @@ public class MainActivity extends Activity {
         }
 
         getPreferences(0).edit()
-            .putString("history", history)
-            .putLong("rounds", rounds)
-            .putLong("hits", hits)
-            .putString("record", Double.toString(record))
+            .putString("history_v4", history)
+            .putLong("rounds_v4", rounds)
+            .putLong("hits_v4", hits)
+            .putString("record_v4", Double.toString(record))
             .apply();
 
         if (positive > 0) alert();
